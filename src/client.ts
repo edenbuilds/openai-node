@@ -1080,8 +1080,13 @@ export class OpenAI {
       return response;
     }
 
-    // Hook the original body's reader/cancel path so we do not replace Response
-    // (which would drop `url`/`redirected` and break byte-stream/BYOB readers).
+    // Hook the original body's reader/cancel and async-iterator paths so we do
+    // not replace Response (which would drop `url`/`redirected` and break
+    // byte-stream/BYOB readers). Critical: `_iterSSEMessages` uses
+    // `ReadableStreamToAsyncIterable`, which prefers native `for await` when
+    // `body[Symbol.asyncIterator]` exists — that path never hits getReader, so
+    // we must wrap the async iterator too or AbortSignal.timeout listeners leak
+    // after successful streams (Deno hang, #1811).
     const body = response.body;
     try {
       const originalGetReader = body.getReader.bind(body);
@@ -1117,6 +1122,53 @@ export class OpenAI {
         value: (reason?: any) => {
           cleanup();
           return originalCancel(reason);
+        },
+      });
+
+      // Prefer our getReader-based async iterator so native for-await (Node/Deno)
+      // still runs cleanup when the stream ends or is early-returned/broken.
+      Object.defineProperty(body, Symbol.asyncIterator, {
+        configurable: true,
+        value: () => {
+          const reader = body.getReader();
+          return {
+            async next() {
+              try {
+                const result = await reader.read();
+                if (result.done) {
+                  try {
+                    reader.releaseLock();
+                  } catch {
+                    // ignore double-release
+                  }
+                }
+                return result;
+              } catch (err) {
+                try {
+                  reader.releaseLock();
+                } catch {
+                  // ignore
+                }
+                throw err;
+              }
+            },
+            async return() {
+              try {
+                await reader.cancel();
+              } catch {
+                // ignore
+              }
+              try {
+                reader.releaseLock();
+              } catch {
+                // ignore
+              }
+              return { done: true as const, value: undefined };
+            },
+            [Symbol.asyncIterator]() {
+              return this;
+            },
+          };
         },
       });
     } catch {

@@ -368,6 +368,50 @@ describe('instantiate client', () => {
     removeSpy.mockRestore();
   });
 
+  test('detaches abort listener after native for-await consumption', async () => {
+    // Regression: ReadableStreamToAsyncIterable prefers body[Symbol.asyncIterator]
+    // and never calls getReader when present. Stream finish must still cleanup.
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        new Response(JSON.stringify({ ok: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    });
+
+    const external = new AbortController();
+    const addSpy = jest.spyOn(external.signal, 'addEventListener');
+    const removeSpy = jest.spyOn(external.signal, 'removeEventListener');
+    const internal = new AbortController();
+
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    const listener = addSpy.mock.calls.find((call) => call[0] === 'abort')?.[1];
+    expect(listener).toBeDefined();
+    expect(
+      removeSpy.mock.calls.some((call) => call[0] === 'abort' && call[1] === listener),
+    ).toBe(false);
+
+    // Consume via native async iteration (same path as SSE streaming on Node).
+    for await (const _chunk of response.body as AsyncIterable<Uint8Array>) {
+      // drain
+    }
+
+    expect(
+      removeSpy.mock.calls.some((call) => call[0] === 'abort' && call[1] === listener),
+    ).toBe(true);
+
+    addSpy.mockRestore();
+    removeSpy.mockRestore();
+  });
+
   test('detaches abort listener immediately for Content-Length: 0 JSON bodies', async () => {
     // defaultParseResponse returns without reading the body when Content-Length is 0,
     // so we must detach even though response.body can be non-null.
