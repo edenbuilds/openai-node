@@ -323,6 +323,43 @@ describe('instantiate client', () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
+  test('removes abort signal listener after a successful fetchWithTimeout', async () => {
+    // Regression for openai/openai-node#1811: leaving { once: true } on AbortSignal.timeout()
+    // (or any long-lived signal) refs the timer on Deno until abort, even after success.
+    const testFetch = async (): Promise<Response> =>
+      new Response(JSON.stringify({ ok: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: testFetch,
+    });
+
+    const external = new AbortController();
+    const addSpy = jest.spyOn(external.signal, 'addEventListener');
+    const removeSpy = jest.spyOn(external.signal, 'removeEventListener');
+    const internal = new AbortController();
+
+    await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    const listener = addSpy.mock.calls.find((call) => call[0] === 'abort')?.[1];
+    expect(listener).toBeDefined();
+    expect(
+      removeSpy.mock.calls.some((call) => call[0] === 'abort' && call[1] === listener),
+    ).toBe(true);
+
+    addSpy.mockRestore();
+    removeSpy.mockRestore();
+  });
+
   test('normalized method', async () => {
     let capturedRequest: RequestInit | undefined;
     const testFetch = async (url: string | URL | Request, init: RequestInit = {}): Promise<Response> => {

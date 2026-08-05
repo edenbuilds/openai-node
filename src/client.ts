@@ -1033,6 +1033,12 @@ export class OpenAI {
       return await this.fetch.call(undefined, url, fetchOptions);
     } finally {
       clearTimeout(timeout);
+      // Remove the forwarder even on success so signals created with AbortSignal.timeout()
+      // (or any long-lived signal) drop their timer ref. Leaving the listener until the
+      // signal eventually aborts keeps Deno from exiting (timer stays ref'd via the
+      // listener), even when the request finished long before the timeout. { once: true }
+      // only helps if abort fires — not on the success path. See openai/openai-node#1811.
+      if (signal) signal.removeEventListener('abort', abort);
     }
   }
 
