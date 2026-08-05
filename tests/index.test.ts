@@ -323,9 +323,10 @@ describe('instantiate client', () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
-  test('removes abort signal listener after a successful fetchWithTimeout', async () => {
-    // Regression for openai/openai-node#1811: leaving { once: true } on AbortSignal.timeout()
-    // (or any long-lived signal) refs the timer on Deno until abort, even after success.
+  test('removes abort signal listener after the response body is fully read', async () => {
+    // Regression for openai/openai-node#1811: leave the abort forwarder active
+    // until the body ends (so streaming aborts still work), then detach so
+    // AbortSignal.timeout() does not keep Deno alive for the full timeout.
     const testFetch = async (): Promise<Response> =>
       new Response(JSON.stringify({ ok: true }), {
         headers: { 'Content-Type': 'application/json' },
@@ -343,7 +344,7 @@ describe('instantiate client', () => {
     const removeSpy = jest.spyOn(external.signal, 'removeEventListener');
     const internal = new AbortController();
 
-    await client.fetchWithTimeout(
+    const response = await client.fetchWithTimeout(
       'http://localhost:5000/foo',
       { signal: external.signal },
       30_000,
@@ -352,12 +353,58 @@ describe('instantiate client', () => {
 
     const listener = addSpy.mock.calls.find((call) => call[0] === 'abort')?.[1];
     expect(listener).toBeDefined();
+    // Still attached after headers (body not consumed yet)
+    expect(
+      removeSpy.mock.calls.some((call) => call[0] === 'abort' && call[1] === listener),
+    ).toBe(false);
+
+    await response.json();
+
     expect(
       removeSpy.mock.calls.some((call) => call[0] === 'abort' && call[1] === listener),
     ).toBe(true);
 
     addSpy.mockRestore();
     removeSpy.mockRestore();
+  });
+
+  test('caller abort still aborts after headers while the body is streaming', async () => {
+    let resolveBody!: (chunk: Uint8Array) => void;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        resolveBody = (chunk) => {
+          controller.enqueue(chunk);
+          controller.close();
+        };
+      },
+    });
+
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        new Response(body, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    });
+
+    const external = new AbortController();
+    const internal = new AbortController();
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    external.abort();
+    // Forwarder should still have aborted the internal controller for the body.
+    expect(internal.signal.aborted).toBe(true);
+    resolveBody(new TextEncoder().encode('{"ok":true}'));
+    // Drain so the body cleanup path can run without hanging the test process.
+    await response.text().catch(() => {});
   });
 
   test('normalized method', async () => {

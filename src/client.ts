@@ -1030,16 +1030,80 @@ export class OpenAI {
 
     try {
       // use undefined this binding; fetch errors if bound to something else in browser/cloudflare
-      return await this.fetch.call(undefined, url, fetchOptions);
+      const response = await this.fetch.call(undefined, url, fetchOptions);
+      // fetch resolves when headers arrive; body may still stream. Keep the caller's
+      // abort forwarder alive until the body finishes (or is cancelled), so
+      // AbortSignal.timeout / manual abort mid-stream still reach `controller`.
+      // Detach after body completion so AbortSignal.timeout() does not keep Deno
+      // alive until the full timeout (#1811).
+      return this._detachAbortOnBodyEnd(response, signal, abort);
+    } catch (err) {
+      if (signal) signal.removeEventListener('abort', abort);
+      throw err;
     } finally {
       clearTimeout(timeout);
-      // Remove the forwarder even on success so signals created with AbortSignal.timeout()
-      // (or any long-lived signal) drop their timer ref. Leaving the listener until the
-      // signal eventually aborts keeps Deno from exiting (timer stays ref'd via the
-      // listener), even when the request finished long before the timeout. { once: true }
-      // only helps if abort fires — not on the success path. See openai/openai-node#1811.
-      if (signal) signal.removeEventListener('abort', abort);
     }
+  }
+
+  /**
+   * Keep an AbortSignal listener until the Response body is fully consumed/cancelled,
+   * then remove it. If there is no body, detach immediately.
+   *
+   * Uses pull-based wrapping so we do not eagerly drain the body; consumers still
+   * drive streaming while aborts from the caller's signal continue to forward.
+   */
+  private _detachAbortOnBodyEnd(
+    response: Response,
+    signal: AbortSignal | null | undefined,
+    abort: () => void,
+  ): Response {
+    if (!signal) return response;
+
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      signal.removeEventListener('abort', abort);
+    };
+
+    if (signal.aborted || response.body == null) {
+      cleanup();
+      return response;
+    }
+
+    const body = response.body;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        reader ??= body.getReader();
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            cleanup();
+            controller.close();
+            return;
+          }
+          controller.enqueue(value);
+        } catch (err) {
+          cleanup();
+          controller.error(err);
+        }
+      },
+      cancel(reason) {
+        cleanup();
+        if (reader) {
+          return reader.cancel(reason);
+        }
+        return body.cancel(reason);
+      },
+    });
+
+    return new Response(stream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   }
 
   private async shouldRetry(response: Response): Promise<boolean> {
