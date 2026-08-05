@@ -1,14 +1,11 @@
-import { OpenAIError } from './error';
+import { OpenAIError, APIError } from './error';
 import { type ReadableStream } from '../internal/shim-types';
-import { makeReadableStream } from '../internal/shims';
+import { makeReadableStream, ReadableStreamToAsyncIterable } from '../internal/shims';
 import { findDoubleNewlineIndex, LineDecoder } from '../internal/decoders/line';
-import { ReadableStreamToAsyncIterable } from '../internal/shims';
 import { isAbortError } from '../internal/errors';
 import { encodeUTF8 } from '../internal/utils/bytes';
 import { loggerFor } from '../internal/utils/log';
 import type { OpenAI } from '../client';
-
-import { APIError } from './error';
 
 type Bytes = string | ArrayBuffer | Uint8Array | null | undefined;
 
@@ -297,7 +294,7 @@ async function* iterSSEChunks(iterator: AsyncIterableIterator<Bytes>): AsyncGene
           ? encodeUTF8(chunk)
           : chunk;
 
-    let newData = new Uint8Array(data.length + binaryChunk.length);
+    const newData = new Uint8Array(data.length + binaryChunk.length);
     newData.set(data);
     newData.set(binaryChunk, data.length);
     data = newData;
@@ -353,7 +350,8 @@ class SSEDecoder {
       return null;
     }
 
-    let [fieldname, _, value] = partition(line, ':');
+    const [fieldname, , initialValue] = partition(line, ':');
+    let value = initialValue;
 
     if (value.startsWith(' ')) {
       value = value.substring(1);
