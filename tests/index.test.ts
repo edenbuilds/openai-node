@@ -368,6 +368,88 @@ describe('instantiate client', () => {
     removeSpy.mockRestore();
   });
 
+  test('detaches abort listener immediately for Content-Length: 0 JSON bodies', async () => {
+    // defaultParseResponse returns without reading the body when Content-Length is 0,
+    // so we must detach even though response.body can be non-null.
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        new Response('', {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': '0',
+          },
+        }),
+    });
+
+    const external = new AbortController();
+    const addSpy = jest.spyOn(external.signal, 'addEventListener');
+    const removeSpy = jest.spyOn(external.signal, 'removeEventListener');
+    const internal = new AbortController();
+
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    const listener = addSpy.mock.calls.find((call) => call[0] === 'abort')?.[1];
+    expect(listener).toBeDefined();
+    expect(
+      removeSpy.mock.calls.some((call) => call[0] === 'abort' && call[1] === listener),
+    ).toBe(true);
+    // Original response identity preserved (no synthetic wrapper).
+    expect(response.headers.get('content-length')).toBe('0');
+
+    addSpy.mockRestore();
+    removeSpy.mockRestore();
+  });
+
+  test('preserves response identity and supports BYOB readers when a signal is used', async () => {
+    const payload = new TextEncoder().encode('{"ok":true}');
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async (url) => {
+        // Real fetch sets url; synthetic Response from `new Response` has empty url
+        // and we must still return THAT object (not a wrapper), so .asResponse metadata
+        // and getReader({ mode: 'byob' }) keep working.
+        return new Response(payload, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      },
+    });
+
+    const external = new AbortController();
+    const internal = new AbortController();
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('application/json');
+
+    // Byte-stream/BYOB: native fetch bodies support this; wrapping in a default
+    // ReadableStream would throw. Keep the original body so this works.
+    const buf = new Uint8Array(payload.byteLength);
+    const reader = response.body!.getReader({ mode: 'byob' });
+    const { done, value } = await reader.read(buf);
+    expect(done).toBe(false);
+    expect(value).toBeDefined();
+    expect(new TextDecoder().decode(value)).toBe('{"ok":true}');
+    const rest = await reader.read(new Uint8Array(1));
+    expect(rest.done).toBe(true);
+  });
+
   test('caller abort still aborts after headers while the body is streaming', async () => {
     let resolveBody!: (chunk: Uint8Array) => void;
     const body = new ReadableStream<Uint8Array>({

@@ -1047,10 +1047,12 @@ export class OpenAI {
 
   /**
    * Keep an AbortSignal listener until the Response body is fully consumed/cancelled,
-   * then remove it. If there is no body, detach immediately.
+   * then remove it. Returns the original Response so url/redirected, byob readers,
+   * and binary `.asResponse()` payloads stay intact.
    *
-   * Uses pull-based wrapping so we do not eagerly drain the body; consumers still
-   * drive streaming while aborts from the caller's signal continue to forward.
+   * Immediate detach when there is nothing to read (null body, 204, Content-Length: 0)
+   * — `defaultParseResponse` skips body reads in those cases, and leaving a
+   * AbortSignal.timeout() listener would keep Deno alive until the timeout (#1811).
    */
   private _detachAbortOnBodyEnd(
     response: Response,
@@ -1066,14 +1068,79 @@ export class OpenAI {
       signal.removeEventListener('abort', abort);
     };
 
-    if (signal.aborted || response.body == null) {
+    if (signal.aborted) {
       cleanup();
       return response;
     }
 
-    const body = response.body;
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const contentLength = response.headers.get('content-length');
+    // Nothing for the consumer (or defaultParseResponse) to read — detach now.
+    if (response.body == null || response.status === 204 || contentLength === '0') {
+      cleanup();
+      return response;
+    }
 
+    // Hook the original body's reader/cancel path so we do not replace Response
+    // (which would drop `url`/`redirected` and break byte-stream/BYOB readers).
+    const body = response.body;
+    try {
+      const originalGetReader = body.getReader.bind(body);
+      Object.defineProperty(body, 'getReader', {
+        configurable: true,
+        value: (...args: any[]) => {
+          const reader = (originalGetReader as (...a: any[]) => any)(...args);
+          const originalRead = reader.read.bind(reader);
+          reader.read = async (...readArgs: any[]) => {
+            try {
+              const result = await originalRead(...readArgs);
+              if (result.done) cleanup();
+              return result;
+            } catch (err) {
+              cleanup();
+              throw err;
+            }
+          };
+
+          const originalCancel = reader.cancel.bind(reader);
+          reader.cancel = (reason?: any) => {
+            cleanup();
+            return originalCancel(reason);
+          };
+
+          return reader;
+        },
+      });
+
+      const originalCancel = body.cancel.bind(body);
+      Object.defineProperty(body, 'cancel', {
+        configurable: true,
+        value: (reason?: any) => {
+          cleanup();
+          return originalCancel(reason);
+        },
+      });
+    } catch {
+      // If the runtime freezes stream methods, fall back to wrapping without
+      // losing identity of a successful request: detach only when body ends via
+      // a best-effort pull stream still drives abort during consumption.
+      return this._wrapResponseBodyForAbortCleanup(response, cleanup);
+    }
+
+    return response;
+  }
+
+  /**
+   * Fallback when the Response body stream methods cannot be patched.
+   * Preserves status/headers and mirrors `url`/`redirected` onto the wrapper.
+   */
+  private _wrapResponseBodyForAbortCleanup(response: Response, cleanup: () => void): Response {
+    const body = response.body;
+    if (body == null) {
+      cleanup();
+      return response;
+    }
+
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     const stream = new ReadableStream<Uint8Array>({
       async pull(controller) {
         reader ??= body.getReader();
@@ -1099,11 +1166,24 @@ export class OpenAI {
       },
     });
 
-    return new Response(stream, {
+    const wrapped = new Response(stream, {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
     });
+
+    try {
+      Object.defineProperty(wrapped, 'url', { value: response.url, enumerable: true });
+      Object.defineProperty(wrapped, 'redirected', {
+        value: response.redirected,
+        enumerable: true,
+      });
+      Object.defineProperty(wrapped, 'type', { value: response.type, enumerable: true });
+    } catch {
+      // Ignore if the host Response forbids redefining identity fields.
+    }
+
+    return wrapped;
   }
 
   private async shouldRetry(response: Response): Promise<boolean> {
