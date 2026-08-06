@@ -349,4 +349,168 @@ describe('AbortSignal forwarder cleanup', () => {
     expect(done.done).toBe(true);
     expect(nextCalls).toBe(3);
   });
+
+  test('locked-body helper reject does not detach abort forwarder', async () => {
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        new Response(JSON.stringify({ ok: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    });
+
+    const external = new AbortController();
+    const { add, remove } = spyAbortSignal(external.signal);
+    const internal = new AbortController();
+
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    const listener = abortListener(add);
+    // Lock the body; text() should reject without consuming.
+    const reader = response.body!.getReader();
+    await expect(response.text()).rejects.toThrow();
+    expect(wasRemoved(remove, listener)).toBe(false);
+
+    // Forwarder still live — mid-stream abort reaches the fetch controller.
+    external.abort();
+    expect(internal.signal.aborted).toBe(true);
+
+    await reader.cancel().catch(() => {});
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
+  test('releaseLock rejection of reader.closed does not detach abort forwarder', async () => {
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        new Response(JSON.stringify({ ok: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    });
+
+    const external = new AbortController();
+    const { add, remove } = spyAbortSignal(external.signal);
+    const internal = new AbortController();
+
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    const listener = abortListener(add);
+    const reader = response.body!.getReader();
+    reader.releaseLock();
+    // Allow reader.closed rejection microtask to run.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(wasRemoved(remove, listener)).toBe(false);
+    external.abort();
+    expect(internal.signal.aborted).toBe(true);
+
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
+  test('response.bytes() detaches abort forwarder when available', async () => {
+    if (typeof (Response.prototype as { bytes?: unknown }).bytes !== 'function') {
+      return; // runtime without bytes()
+    }
+
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        new Response(JSON.stringify({ ok: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    });
+
+    const external = new AbortController();
+    const { add, remove } = spyAbortSignal(external.signal);
+    const internal = new AbortController();
+
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    const listener = abortListener(add);
+    await (response as Response & { bytes(): Promise<Uint8Array> }).bytes();
+    expect(wasRemoved(remove, listener)).toBe(true);
+
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
+  test('cancelling an unread async-iterable bridge tears down upstream', async () => {
+    let returned = false;
+    const iterableBody = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            return { done: false as const, value: new TextEncoder().encode('x') };
+          },
+          async return() {
+            returned = true;
+            return { done: true as const, value: undefined };
+          },
+        };
+      },
+    };
+
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        ({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: new Headers({ 'Content-Type': 'application/octet-stream' }),
+          body: iterableBody,
+          url: 'http://localhost:5000/foo',
+          redirected: false,
+          type: 'basic',
+          clone() {
+            return this;
+          },
+          arrayBuffer: async () => new ArrayBuffer(0),
+          blob: async () => new Blob(),
+          formData: async () => new FormData(),
+          json: async () => ({}),
+          text: async () => '',
+          bytes: async () => new Uint8Array(),
+        }) as unknown as Response,
+    });
+
+    const external = new AbortController();
+    const internal = new AbortController();
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    // Simulate retry CancelReadableStream before any pull.
+    await response.body!.cancel('retry');
+    expect(returned).toBe(true);
+  });
 });

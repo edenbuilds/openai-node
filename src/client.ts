@@ -423,6 +423,38 @@ function isReadableStreamTerminal(body: ReadableStream<Uint8Array>): boolean {
 }
 
 /**
+ * Tear down a node-fetch / Node stream style async-iterable body, including when
+ * CancelReadableStream runs before any pull() (iterator still undefined).
+ */
+async function tearDownAsyncIterableBody(
+  body: any,
+  iterator: AsyncIterator<unknown> | undefined,
+  reason: unknown,
+): Promise<void> {
+  try {
+    if (iterator?.return) {
+      await iterator.return(reason);
+      return;
+    }
+    if (typeof body.cancel === 'function') {
+      await body.cancel(reason);
+      return;
+    }
+    if (typeof body.destroy === 'function') {
+      body.destroy(reason instanceof Error ? reason : undefined);
+      return;
+    }
+    // Never pulled: open an iterator solely to invoke return()/close.
+    if (typeof body[Symbol.asyncIterator] === 'function') {
+      const it = body[Symbol.asyncIterator]() as AsyncIterator<unknown>;
+      if (it.return) await it.return(reason);
+    }
+  } catch {
+    // Best-effort teardown — retries must proceed even if upstream close throws.
+  }
+}
+
+/**
  * API Client for interfacing with the OpenAI API.
  */
 export class OpenAI {
@@ -1101,10 +1133,13 @@ export class OpenAI {
    * AbortSignal.timeout() listener would keep Deno alive until the timeout (#1811).
    *
    * Coverage:
-   * - public Response.json/text/... (Deno drains the body via private readers)
+   * - public Response.json/text/bytes/... (Deno/Bun drain via private readers)
    * - body.getReader / cancel / asyncIterator (Node streaming / SDK SSE)
    * - body.pipeTo / values (native stream helpers that skip getReader)
    * - parse-time detach via `releaseAbortCleanup` for non-stream responses
+   *
+   * Cleanup is state-aware: success / terminal stream only — not on early helper
+   * rejects (locked body) or reader.closed rejection (releaseLock).
    */
   private _detachAbortOnBodyEnd(
     response: Response,
@@ -1136,9 +1171,10 @@ export class OpenAI {
       return response;
     }
 
-    // Response body helpers — Deno/undici often drain through internals; these
-    // instance methods still wrap the full consume path for the common API.
-    for (const method of ['arrayBuffer', 'blob', 'formData', 'json', 'text'] as const) {
+    // Response body helpers — Deno/Bun/undici often drain through internals; wrap
+    // the public helpers so successful consumption still detaches. Do NOT use an
+    // unconditional finally: a locked-body early reject must keep the forwarder.
+    for (const method of ['arrayBuffer', 'blob', 'bytes', 'formData', 'json', 'text'] as const) {
       try {
         const original = (response as any)[method]?.bind(response);
         if (typeof original !== 'function') continue;
@@ -1146,9 +1182,17 @@ export class OpenAI {
           configurable: true,
           value: async (...args: any[]) => {
             try {
-              return await original(...args);
-            } finally {
+              const result = await original(...args);
+              // Success ⇒ body was fully consumed (or empty).
               cleanup();
+              return result;
+            } catch (err) {
+              // Early reject (e.g. body already locked) leaves the stream active —
+              // only detach if the body is gone or terminal afterward.
+              if (response.body == null || isReadableStreamTerminal(response.body)) {
+                cleanup();
+              }
+              throw err;
             }
           },
         });
@@ -1176,6 +1220,7 @@ export class OpenAI {
               if (result.done) cleanup();
               return result;
             } catch (err) {
+              // Stream/read failure is terminal for this reader path.
               cleanup();
               throw err;
             }
@@ -1187,10 +1232,16 @@ export class OpenAI {
             return originalCancel(reason);
           };
 
-          // Some consumers stop after the last chunk without a trailing {done:true}
-          // read — observe reader.closed so cleanup still runs (#1811).
+          // Fulfillment of reader.closed ⇒ stream finished for this reader.
+          // Rejection often means releaseLock() — body may still be readable; do
+          // not detach the abort forwarder in that case.
           if (reader.closed && typeof reader.closed.then === 'function') {
-            reader.closed.then(() => cleanup(), () => cleanup());
+            reader.closed.then(
+              () => cleanup(),
+              () => {
+                /* releaseLock / non-terminal — keep forwarding */
+              },
+            );
           }
 
           return reader;
@@ -1319,10 +1370,10 @@ export class OpenAI {
         },
         cancel(reason) {
           cleanup();
-          if (iterator?.return) {
-            return Promise.resolve(iterator.return(reason)).then(() => undefined);
-          }
-          return body.cancel?.(reason);
+          // Retry paths call CancelReadableStream before any pull — iterator may
+          // still be undefined. Always tear down the upstream iterable/Node stream
+          // so the socket does not keep downloading under a "cancelled" wrapper.
+          return tearDownAsyncIterableBody(body, iterator, reason);
         },
       },
       // highWaterMark 0: do not prefetch — pull only when a consumer reads
