@@ -1395,15 +1395,20 @@ OpenAI.Videos = Videos;
  * from it (#1811).
  *
  * The composed signal replaces `controller.signal` rather than being handed to
- * `fetch` on its own, so the controller stays the single record of whether the
- * request was cancelled: `Stream` and the streaming helpers read it to tell
- * cancellation apart from failure, and `controller.abort()` keeps normalising
- * aborts to an `AbortError` no matter what reason the caller aborted with.
+ * `fetch` on its own, so the controller stays the single record of whether a
+ * request was cancelled. Both readers of a response body rely on that: `Stream`
+ * tells cancellation apart from failure with it, and `defaultParseResponse`
+ * reports a cancelled read as an `AbortError` — a composed signal aborts with
+ * the caller's reason, which is not necessarily an `AbortError`.
  *
- * Returns `false` when the runtime predates `AbortSignal.any` (Node < 18.17,
- * Safari < 17.4), or when the caller's signal is polyfilled or from another
- * realm — `AbortSignal.any` ignores those rather than rejecting them, which
- * would silently drop the caller's abort. Callers then forward with a listener.
+ * Returns `false` when the runtime predates `AbortSignal.any` (Deno < 1.38.2,
+ * Safari < 17.4; every Node.js release this package supports has it), or when
+ * the caller's signal is polyfilled or from another realm — `AbortSignal.any`
+ * ignores those rather than rejecting them, which would silently drop the
+ * caller's abort. Those requests fall back to forwarding with a listener, and on
+ * the affected Deno versions they keep hanging: nothing can watch a caller's
+ * signal without listening to it, and detaching before the body ends would cut
+ * off mid-stream aborts.
  */
 function adoptCallerAbortSignal(controller: AbortController, callerSignal: AbortSignal): boolean {
   const nativeAbortSignal = (globalThis as any).AbortSignal;

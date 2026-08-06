@@ -156,6 +156,43 @@ describe('caller AbortSignal handling', () => {
     expect(internal.signal.aborted).toBe(true);
   });
 
+  test('a caller abort mid-body is reported as an AbortError', async () => {
+    const client = makeClient(async (_url: any, init: any) => {
+      const signal = init.signal as AbortSignal;
+      const body = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          streamController.enqueue(new TextEncoder().encode('{"ok"'));
+          signal.addEventListener('abort', () => streamController.error(signal.reason), { once: true });
+        },
+      });
+      return new Response(body, { headers: { 'Content-Type': 'application/json' } });
+    });
+
+    const caller = new AbortController();
+    const request = client.get('/foo', { signal: caller.signal });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Callers classify cancellation by AbortError, so the reason the caller
+    // aborted with must not reach them in its place.
+    caller.abort(new DOMException('The operation was timed out.', 'TimeoutError'));
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  test('a body read that fails on its own keeps its error', async () => {
+    const client = makeClient(async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          streamController.error(new Error('connection reset'));
+        },
+      });
+      return new Response(body, { headers: { 'Content-Type': 'application/json' } });
+    });
+
+    await expect(client.get('/foo', { signal: new AbortController().signal })).rejects.toThrow(
+      'connection reset',
+    );
+  });
+
   test('leaves the response untouched', async () => {
     const client = makeClient(async () => jsonResponse());
 
