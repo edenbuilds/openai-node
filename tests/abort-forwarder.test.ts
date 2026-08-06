@@ -724,6 +724,115 @@ describe('AbortSignal forwarder cleanup', () => {
     remove.mockRestore();
   });
 
+  test('releases the reader lock after async iteration, like the native iterator', async () => {
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        new Response(JSON.stringify({ ok: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    });
+
+    const external = new AbortController();
+    const internal = new AbortController();
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    for await (const _chunk of response.body as AsyncIterable<Uint8Array>) {
+      // drain
+    }
+
+    expect(response.body!.locked).toBe(false);
+    // A permanently locked body would make this throw ERR_INVALID_STATE.
+    expect(() => response.body!.getReader()).not.toThrow();
+  });
+
+  test('releases the reader lock when async iteration exits early', async () => {
+    const payload = new TextEncoder().encode('abcdefgh');
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        new Response(payload, {
+          status: 200,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        }),
+    });
+
+    const external = new AbortController();
+    const internal = new AbortController();
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    for await (const _chunk of response.body as AsyncIterable<Uint8Array>) {
+      break;
+    }
+
+    expect(response.body!.locked).toBe(false);
+  });
+
+  test('detaches when a body helper rejects after draining through internal readers', async () => {
+    // Deno reads bodies with internal readers, so a mid-read failure surfaces
+    // only as a rejected helper: no patched stream method sees it, and standard
+    // streams expose no state to inspect afterwards.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error('body failed mid-read'));
+      },
+    });
+
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () =>
+        ({
+          ok: false,
+          status: 500,
+          statusText: 'Internal Server Error',
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          body,
+          bodyUsed: false,
+          url: 'http://localhost:5000/foo',
+          redirected: false,
+          type: 'basic',
+          text: async () => {
+            throw new Error('body failed mid-read');
+          },
+        }) as unknown as Response,
+    });
+
+    const external = new AbortController();
+    const { add, remove } = spyAbortSignal(external.signal);
+    const internal = new AbortController();
+
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    const listener = abortListener(add);
+    // The helper owned a usable body, so its rejection is terminal.
+    await expect(response.text()).rejects.toThrow('body failed mid-read');
+    expect(wasRemoved(remove, listener)).toBe(true);
+
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
   test('does not build a synthetic body for null-body statuses', async () => {
     const iterableBody = {
       [Symbol.asyncIterator]() {

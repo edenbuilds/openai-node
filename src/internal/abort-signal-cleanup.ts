@@ -382,26 +382,41 @@ export function attachAbortCleanup(
       configurable: true,
       value: () => {
         const reader = body.getReader();
+        // The native iterator releases its reader once iteration ends, errors, or
+        // is exited early; without that the body would stay locked forever and a
+        // later `getReader()` would throw.
+        const release = () => {
+          try {
+            reader.releaseLock();
+          } catch {
+            // ignore
+          }
+        };
         return wrapAsyncIterator(
           {
-            next: () => reader.read(),
+            async next() {
+              try {
+                const result = await reader.read();
+                if (result.done) release();
+                return result;
+              } catch (err) {
+                // This reader is private to the iterator and only ever issues
+                // plain reads, so a rejection here means the stream errored.
+                release();
+                throw err;
+              }
+            },
             async return() {
               try {
                 await reader.cancel();
               } catch {
                 // ignore
               }
-              try {
-                reader.releaseLock();
-              } catch {
-                // ignore
-              }
+              release();
               return { done: true as const, value: undefined };
             },
           },
           done,
-          // The hooked reader already reports terminal state via `closed`.
-          { onError: false },
         );
       },
     });
@@ -418,12 +433,21 @@ export function attachAbortCleanup(
         Object.defineProperty(res, method, {
           configurable: true,
           value: async (...args: any[]) => {
+            // Whether the helper can take ownership of the body decides how to
+            // read a later rejection, and standard streams expose no state to
+            // tell the two apart afterwards.
+            const unusable = res.bodyUsed === true || res.body?.locked === true;
             try {
               const result = await original(...args);
               done();
               return result;
             } catch (err) {
-              if (res.body == null || isStreamTerminal(res.body)) done();
+              // Owning a usable body and still rejecting means the read itself
+              // failed, which is terminal — including in runtimes that drain
+              // through internal readers none of the stream hooks can see.
+              // Rejecting on an already locked or used body consumed nothing, so
+              // the live body keeps the forwarder.
+              if (!unusable || res.body == null || isStreamTerminal(res.body)) done();
               throw err;
             }
           },
