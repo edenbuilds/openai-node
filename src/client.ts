@@ -8,7 +8,6 @@ import { sleep } from './internal/utils/sleep';
 export type { Logger, LogLevel } from './internal/utils/log';
 import { castToError, isAbortError } from './internal/errors';
 import type { APIResponseProps } from './internal/parse';
-import { combineAbortSignals } from './internal/abort-signal';
 import { getPlatformHeaders } from './internal/detect-platform';
 import * as Shims from './internal/shims';
 import * as Opts from './internal/request-options';
@@ -1013,8 +1012,8 @@ export class OpenAI {
     // signal outlives the request, and in Deno that keeps an
     // `AbortSignal.timeout()` timer referenced, holding the process open until
     // the timeout fires (#1811).
-    const requestSignal = combineAbortSignals(controller.signal, signal);
-    if (requestSignal === controller.signal && signal) {
+    const composed = signal ? adoptCallerAbortSignal(controller, signal) : false;
+    if (signal && !composed) {
       signal.addEventListener('abort', abort, { once: true });
     }
 
@@ -1025,7 +1024,7 @@ export class OpenAI {
       (typeof options.body === 'object' && options.body !== null && Symbol.asyncIterator in options.body);
 
     const fetchOptions: RequestInit = {
-      signal: requestSignal as any,
+      signal: controller.signal as any,
       ...(isReadableBody ? { duplex: 'half' } : {}),
       method: 'GET',
       ...options,
@@ -1040,7 +1039,7 @@ export class OpenAI {
       // use undefined this binding; fetch errors if bound to something else in browser/cloudflare
       return await this.fetch.call(undefined, url, fetchOptions);
     } catch (err) {
-      if (signal) signal.removeEventListener('abort', abort);
+      if (signal && !composed) signal.removeEventListener('abort', abort);
       throw err;
     } finally {
       clearTimeout(timeout);
@@ -1382,6 +1381,43 @@ OpenAI.Evals = Evals;
 OpenAI.Containers = Containers;
 OpenAI.Skills = Skills;
 OpenAI.Videos = Videos;
+
+/**
+ * Widen a request's controller so its signal also aborts with `callerSignal`,
+ * and report whether that worked.
+ *
+ * `AbortSignal.any` records its result as a dependent of the source signals
+ * instead of registering a listener on them, which is the property that matters
+ * here: anything that listens to the caller's signal has to outlive the request
+ * (`fetch` resolves when headers arrive, so detaching there would cut off
+ * mid-stream aborts), and Deno keeps an `AbortSignal.timeout()` timer referenced
+ * for as long as its signal is listened to — including through a signal composed
+ * from it (#1811).
+ *
+ * The composed signal replaces `controller.signal` rather than being handed to
+ * `fetch` on its own, so the controller stays the single record of whether the
+ * request was cancelled: `Stream` and the streaming helpers read it to tell
+ * cancellation apart from failure, and `controller.abort()` keeps normalising
+ * aborts to an `AbortError` no matter what reason the caller aborted with.
+ *
+ * Returns `false` when the runtime predates `AbortSignal.any` (Node < 18.17,
+ * Safari < 17.4), or when the caller's signal is polyfilled or from another
+ * realm — `AbortSignal.any` ignores those rather than rejecting them, which
+ * would silently drop the caller's abort. Callers then forward with a listener.
+ */
+function adoptCallerAbortSignal(controller: AbortController, callerSignal: AbortSignal): boolean {
+  const nativeAbortSignal = (globalThis as any).AbortSignal;
+  if (typeof nativeAbortSignal?.any !== 'function' || !(callerSignal instanceof nativeAbortSignal)) {
+    return false;
+  }
+  try {
+    const composed = nativeAbortSignal.any([controller.signal, callerSignal]) as AbortSignal;
+    Object.defineProperty(controller, 'signal', { value: composed, configurable: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function getConnectionErrorMessage(error: Error): string | undefined {
   if (isUndiciDispatcherVersionMismatchError(error)) {

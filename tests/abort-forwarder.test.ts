@@ -1,7 +1,7 @@
 import { getEventListeners } from 'node:events';
 
 import OpenAI from 'openai';
-import { combineAbortSignals } from 'openai/internal/abort-signal';
+import { Stream } from 'openai/core/streaming';
 
 /**
  * Regressions for #1811: a request made with a caller signal must not leave that
@@ -80,6 +80,24 @@ describe('caller AbortSignal handling', () => {
     await response.text().catch(() => {});
   });
 
+  test('the request signal records a caller abort', async () => {
+    let observed: AbortSignal | undefined;
+    const client = makeClient(async (_url: any, init: any) => {
+      observed = init.signal;
+      return jsonResponse();
+    });
+
+    const external = new AbortController();
+    const internal = new AbortController();
+    await client.fetchWithTimeout('http://localhost:5000/foo', { signal: external.signal }, 30_000, internal);
+
+    // `Stream` and the streaming helpers decide between cancellation and failure
+    // by reading the request controller, so it has to see the caller's abort.
+    expect(observed).toBe(internal.signal);
+    external.abort();
+    expect(internal.signal.aborted).toBe(true);
+  });
+
   test('the request controller still aborts the fetch on its own', async () => {
     let observed: AbortSignal | undefined;
     const client = makeClient(async (_url: any, init: any) => {
@@ -95,6 +113,47 @@ describe('caller AbortSignal handling', () => {
     internal.abort();
     expect(observed!.aborted).toBe(true);
     expect(external.signal.aborted).toBe(false);
+  });
+
+  test('an SSE stream ends cleanly when the caller aborts with a non-AbortError reason', async () => {
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+    const client = makeClient(async (_url: any, init: any) => {
+      const signal = init.signal as AbortSignal;
+      const body = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          bodyController = streamController;
+          // What fetch does: reads reject with whatever the signal aborted with.
+          signal.addEventListener('abort', () => streamController.error(signal.reason), { once: true });
+        },
+      });
+      return new Response(body, { headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const external = new AbortController();
+    const internal = new AbortController();
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    const chunks: unknown[] = [];
+    const stream = Stream.fromSSEResponse<{ n: number }>(response, internal);
+    const iterating = (async () => {
+      for await (const chunk of stream) chunks.push(chunk);
+    })();
+
+    bodyController.enqueue(new TextEncoder().encode('data: {"n":1}\n\n'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // `AbortSignal.timeout()` aborts with a TimeoutError, and a caller may abort
+    // with any reason at all; neither is an AbortError.
+    external.abort(new DOMException('The operation was timed out.', 'TimeoutError'));
+
+    await expect(iterating).resolves.toBeUndefined();
+    expect(chunks).toEqual([{ n: 1 }]);
+    expect(internal.signal.aborted).toBe(true);
   });
 
   test('leaves the response untouched', async () => {
@@ -116,56 +175,6 @@ describe('caller AbortSignal handling', () => {
     const reader = response.body!.getReader({ mode: 'byob' });
     const { value } = await reader.read(new Uint8Array(32));
     expect(new TextDecoder().decode(value)).toBe('{"ok":true}');
-  });
-
-  describe('combineAbortSignals', () => {
-    test('aborts when either input aborts, without listening on them', () => {
-      const controller = new AbortController();
-      const caller = new AbortController();
-
-      const combined = combineAbortSignals(controller.signal, caller.signal);
-      expect(combined).not.toBe(controller.signal);
-      expect(getEventListeners(caller.signal, 'abort')).toHaveLength(0);
-
-      caller.abort(new Error('caller went away'));
-      expect(combined.aborted).toBe(true);
-      expect((combined.reason as Error).message).toBe('caller went away');
-
-      const other = combineAbortSignals(new AbortController().signal, controller.signal);
-      controller.abort();
-      expect(other.aborted).toBe(true);
-    });
-
-    test('passes the controller signal through when there is nothing to combine', () => {
-      const controller = new AbortController();
-      expect(combineAbortSignals(controller.signal, undefined)).toBe(controller.signal);
-      expect(combineAbortSignals(controller.signal, null)).toBe(controller.signal);
-    });
-
-    test('falls back when the caller signal is not composable', () => {
-      // Polyfilled signals (e.g. the `abort-controller` package) are rejected by
-      // native AbortSignal.any.
-      const polyfilled = {
-        aborted: false,
-        addEventListener() {},
-        removeEventListener() {},
-      } as unknown as AbortSignal;
-
-      const controller = new AbortController();
-      expect(combineAbortSignals(controller.signal, polyfilled)).toBe(controller.signal);
-    });
-
-    test('falls back to the controller signal without AbortSignal.any', () => {
-      const original = (AbortSignal as any).any;
-      try {
-        (AbortSignal as any).any = undefined;
-        const controller = new AbortController();
-        const caller = new AbortController();
-        expect(combineAbortSignals(controller.signal, caller.signal)).toBe(controller.signal);
-      } finally {
-        (AbortSignal as any).any = original;
-      }
-    });
   });
 
   test('forwards aborts with a listener when AbortSignal.any is unavailable', async () => {
@@ -194,6 +203,34 @@ describe('caller AbortSignal handling', () => {
     } finally {
       (AbortSignal as any).any = original;
     }
+  });
+
+  test('forwards aborts with a listener when the caller signal is not composable', async () => {
+    // Polyfilled signals (e.g. the `abort-controller` package) are rejected by
+    // native AbortSignal.any.
+    let forward: (() => void) | undefined;
+    const polyfilled = {
+      aborted: false,
+      addEventListener: (_type: string, listener: () => void) => {
+        forward = listener;
+      },
+      removeEventListener: () => {
+        forward = undefined;
+      },
+    } as unknown as AbortSignal;
+
+    let observed: AbortSignal | undefined;
+    const client = makeClient(async (_url: any, init: any) => {
+      observed = init.signal;
+      return jsonResponse();
+    });
+
+    const internal = new AbortController();
+    await client.fetchWithTimeout('http://localhost:5000/foo', { signal: polyfilled }, 30_000, internal);
+
+    expect(observed).toBe(internal.signal);
+    forward!();
+    expect(internal.signal.aborted).toBe(true);
   });
 
   test('removes the fallback listener when the fetch itself fails', async () => {
