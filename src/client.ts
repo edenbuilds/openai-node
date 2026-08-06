@@ -8,7 +8,7 @@ import { sleep } from './internal/utils/sleep';
 export type { Logger, LogLevel } from './internal/utils/log';
 import { castToError, isAbortError } from './internal/errors';
 import type { APIResponseProps } from './internal/parse';
-import { attachAbortCleanup } from './internal/abort-signal-cleanup';
+import { combineAbortSignals } from './internal/abort-signal';
 import { getPlatformHeaders } from './internal/detect-platform';
 import * as Shims from './internal/shims';
 import * as Opts from './internal/request-options';
@@ -1009,7 +1009,14 @@ export class OpenAI {
   ): Promise<Response> {
     const { signal, method, ...options } = init || {};
     const abort = this._makeAbort(controller);
-    if (signal) signal.addEventListener('abort', abort, { once: true });
+    // Composing beats forwarding with a listener: a listener on the caller's
+    // signal outlives the request, and in Deno that keeps an
+    // `AbortSignal.timeout()` timer referenced, holding the process open until
+    // the timeout fires (#1811).
+    const requestSignal = combineAbortSignals(controller.signal, signal);
+    if (requestSignal === controller.signal && signal) {
+      signal.addEventListener('abort', abort, { once: true });
+    }
 
     const timeout = setTimeout(abort, ms);
 
@@ -1018,7 +1025,7 @@ export class OpenAI {
       (typeof options.body === 'object' && options.body !== null && Symbol.asyncIterator in options.body);
 
     const fetchOptions: RequestInit = {
-      signal: controller.signal as any,
+      signal: requestSignal as any,
       ...(isReadableBody ? { duplex: 'half' } : {}),
       method: 'GET',
       ...options,
@@ -1031,10 +1038,7 @@ export class OpenAI {
 
     try {
       // use undefined this binding; fetch errors if bound to something else in browser/cloudflare
-      const response = await this.fetch.call(undefined, url, fetchOptions);
-      // fetch resolves when headers arrive, so the forwarder has to outlive this
-      // call for mid-stream aborts, but must not outlive the body (#1811).
-      return attachAbortCleanup(response, signal, abort, controller);
+      return await this.fetch.call(undefined, url, fetchOptions);
     } catch (err) {
       if (signal) signal.removeEventListener('abort', abort);
       throw err;

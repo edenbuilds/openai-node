@@ -3,7 +3,6 @@
 import type { FinalRequestOptions } from './request-options';
 import { Stream } from '../core/streaming';
 import { type OpenAI } from '../client';
-import { releaseAbortCleanup } from './abort-signal-cleanup';
 import { formatRequestDetails, loggerFor } from './utils/log';
 import type { AbstractPage } from '../pagination';
 
@@ -51,8 +50,6 @@ export async function defaultParseResponse<T>(
     }
 
     if (props.options.__binaryResponse) {
-      // Caller still owns the Response body — keep the abort forwarder alive until
-      // they consume/cancel it (see client body hooks).
       return response as unknown as T;
     }
 
@@ -72,17 +69,7 @@ export async function defaultParseResponse<T>(
 
     const text = await response.text();
     return text as unknown as T;
-  })().finally(() => {
-    // The SDK owns the body here, so release the caller's abort forwarder once
-    // parsing settles — runtimes such as Deno drain the body through internal
-    // readers that the response hooks cannot observe, and a rejected `json()`
-    // has still consumed it. Streaming and raw-binary responses stay with the
-    // caller and keep their body hooks instead.
-    if (!props.options.stream && !props.options.__binaryResponse) {
-      releaseAbortCleanup(response);
-    }
-  });
-
+  })();
   loggerFor(client).debug(
     `[${requestLogID}] response parsed`,
     formatRequestDetails({

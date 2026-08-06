@@ -1,678 +1,104 @@
 import { getEventListeners } from 'node:events';
-import { vi } from 'vitest';
 
 import OpenAI from 'openai';
-import { releaseAbortCleanup } from 'openai/internal/abort-signal-cleanup';
+import { combineAbortSignals } from 'openai/internal/abort-signal';
 
 /**
- * Handwritten regressions for AbortSignal forwarder cleanup (#1811 / PR #2086).
- * Kept out of the Stainless-generated `tests/index.test.ts` projection.
+ * Regressions for #1811: a request made with a caller signal must not leave that
+ * signal holding a reference to the request. Kept out of the Stainless-generated
+ * `tests/index.test.ts` projection.
  */
 
-function spyAbortSignal(signal: AbortSignal) {
-  return {
-    add: vi.spyOn(signal, 'addEventListener'),
-    remove: vi.spyOn(signal, 'removeEventListener'),
-  };
+function makeClient(fetchImpl: typeof fetch | (() => Promise<Response>)) {
+  return new OpenAI({
+    baseURL: 'http://localhost:5000/',
+    apiKey: 'My API Key',
+    adminAPIKey: 'My Admin API Key',
+    maxRetries: 0,
+    fetch: fetchImpl as any,
+  });
 }
 
-function abortListener(add: ReturnType<typeof vi.spyOn>) {
-  return add.mock.calls.find((call: any[]) => call[0] === 'abort')?.[1];
-}
+const jsonResponse = () =>
+  new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
 
-function wasRemoved(remove: ReturnType<typeof vi.spyOn>, listener: unknown) {
-  return remove.mock.calls.some((call: any[]) => call[0] === 'abort' && call[1] === listener);
-}
-
-/** Same key the internal cleanup module stores its hook under. */
-const CLEANUP_HOOK = Symbol.for('openai.abortForwarderCleanup');
-
-describe('AbortSignal forwarder cleanup', () => {
-  test('leaves no listener on an AbortSignal.timeout() signal after a request (#1811)', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
+describe('caller AbortSignal handling', () => {
+  test('leaves no listener on the caller signal after a request (#1811)', async () => {
+    const client = makeClient(async () => jsonResponse());
 
     const signal = AbortSignal.timeout(30_000);
     await client.get('/foo', { signal });
 
-    // A lingering listener is what keeps Deno alive until the timeout fires.
+    // A listener here keeps Deno's timeout timer referenced, so the process
+    // cannot exit until the timeout fires.
     expect(getEventListeners(signal, 'abort')).toHaveLength(0);
   });
 
-  test('removes abort signal listener after the response body is fully read', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
+  test('does not accumulate listeners when one signal is reused', async () => {
+    const client = makeClient(async () => jsonResponse());
 
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    expect(listener).toBeDefined();
-    expect(wasRemoved(remove, listener)).toBe(false);
-
-    await response.json();
-    expect(wasRemoved(remove, listener)).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('detaches after response.json() when getReader body hooks are bypassed', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () => {
-        const response = new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        });
-        Object.defineProperty(response, 'json', {
-          configurable: true,
-          value: async function (this: Response) {
-            const buf = await Response.prototype.arrayBuffer.call(this);
-            return JSON.parse(new TextDecoder().decode(buf));
-          },
-        });
-        return response;
-      },
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    await response.json();
-    releaseAbortCleanup(response);
-
-    expect(listener).toBeDefined();
-    expect(wasRemoved(remove, listener)).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('detaches after native for-await consumption', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    expect(wasRemoved(remove, listener)).toBe(false);
-
-    for await (const _chunk of response.body as AsyncIterable<Uint8Array>) {
-      // drain
+    const controller = new AbortController();
+    for (let i = 0; i < 5; i++) {
+      await client.get('/foo', { signal: controller.signal });
     }
 
-    expect(wasRemoved(remove, listener)).toBe(true);
-    add.mockRestore();
-    remove.mockRestore();
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
   });
 
-  test('detaches immediately for Content-Length: 0 JSON bodies', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response('', {
-          status: 200,
-          headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': '0',
-          },
-        }),
-    });
+  test('caller abort before the request rejects with APIUserAbortError', async () => {
+    const client = makeClient(async () => jsonResponse());
 
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
+    const controller = new AbortController();
+    controller.abort();
 
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    expect(listener).toBeDefined();
-    expect(wasRemoved(remove, listener)).toBe(true);
-    expect(response.headers.get('content-length')).toBe('0');
-
-    add.mockRestore();
-    remove.mockRestore();
+    await expect(client.get('/foo', { signal: controller.signal })).rejects.toThrow(OpenAI.APIUserAbortError);
   });
 
-  test('preserves response identity and supports BYOB readers when a signal is used', async () => {
-    const payload = new TextEncoder().encode('{"ok":true}');
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(payload, {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
-
-    const external = new AbortController();
-    const internal = new AbortController();
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    expect(response.status).toBe(200);
-    const buf = new Uint8Array(payload.byteLength);
-    const reader = response.body!.getReader({ mode: 'byob' });
-    const { done, value } = await reader.read(buf);
-    expect(done).toBe(false);
-    expect(new TextDecoder().decode(value)).toBe('{"ok":true}');
-    expect((await reader.read(new Uint8Array(1))).done).toBe(true);
-  });
-
-  test('caller abort still aborts after headers while the body is streaming', async () => {
-    let resolveBody!: (chunk: Uint8Array) => void;
+  test('caller abort reaches the fetch after headers arrive', async () => {
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
-        resolveBody = (chunk) => {
-          controller.enqueue(chunk);
-          controller.close();
-        };
+        bodyController = controller;
       },
     });
 
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(body, {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
+    let observed: AbortSignal | undefined;
+    const client = makeClient(async (_url: any, init: any) => {
+      observed = init.signal;
+      return new Response(body, { headers: { 'Content-Type': 'text/event-stream' } });
     });
 
-    const external = new AbortController();
-    const internal = new AbortController();
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
+    const controller = new AbortController();
+    const response = await client.get('/foo', { signal: controller.signal }).asResponse();
 
-    external.abort();
-    expect(internal.signal.aborted).toBe(true);
-    resolveBody(new TextEncoder().encode('{"ok":true}'));
+    // Body still streaming: the request must remain abortable.
+    expect(observed!.aborted).toBe(false);
+    controller.abort();
+    expect(observed!.aborted).toBe(true);
+
+    bodyController.close();
     await response.text().catch(() => {});
   });
 
-  test('pipeTo with preventCancel keeps abort forwarder when destination rejects', async () => {
-    const payload = new TextEncoder().encode('chunk-one');
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(payload, {
-          status: 200,
-          headers: { 'Content-Type': 'application/octet-stream' },
-        }),
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    const failingDest = new WritableStream({
-      write() {
-        throw new Error('dest failed');
-      },
-    });
-
-    await expect(response.body!.pipeTo(failingDest, { preventCancel: true })).rejects.toThrow('dest failed');
-    // Source left open — forwarder must remain so a later abort still works.
-    expect(wasRemoved(remove, listener)).toBe(false);
-    expect(internal.signal.aborted).toBe(false);
-
-    external.abort();
-    expect(internal.signal.aborted).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('async-iterable custom fetch bodies are bridged with pull backpressure', async () => {
-    let nextCalls = 0;
-    const chunks = [new TextEncoder().encode('a'), new TextEncoder().encode('b')];
-    const iterableBody = {
-      [Symbol.asyncIterator]() {
-        let i = 0;
-        return {
-          async next() {
-            nextCalls += 1;
-            if (i >= chunks.length) return { done: true as const, value: undefined };
-            return { done: false as const, value: chunks[i++] };
-          },
-        };
-      },
-    };
-
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        ({
-          ok: true,
-          status: 200,
-          statusText: 'OK',
-          headers: new Headers({ 'Content-Type': 'application/octet-stream' }),
-          body: iterableBody,
-          url: 'http://localhost:5000/foo',
-          redirected: false,
-          type: 'basic',
-          clone() {
-            return this;
-          },
-          arrayBuffer: async () => new ArrayBuffer(0),
-          blob: async () => new Blob([]),
-          formData: async () => new FormData(),
-          json: async () => ({}),
-          text: async () => '',
-          bytes: async () => new Uint8Array(),
-        }) as unknown as Response,
+  test('the request controller still aborts the fetch on its own', async () => {
+    let observed: AbortSignal | undefined;
+    const client = makeClient(async (_url: any, init: any) => {
+      observed = init.signal;
+      return jsonResponse();
     });
 
     const external = new AbortController();
     const internal = new AbortController();
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    // Obtaining the response must not drain the iterable (no start()-time for-await).
-    expect(nextCalls).toBe(0);
-
-    const reader = response.body!.getReader();
-    const first = await reader.read();
-    expect(first.done).toBe(false);
-    expect(nextCalls).toBe(1);
-
-    const second = await reader.read();
-    expect(second.done).toBe(false);
-    expect(nextCalls).toBe(2);
-
-    const done = await reader.read();
-    expect(done.done).toBe(true);
-    expect(nextCalls).toBe(3);
-  });
-
-  test('locked-body helper reject does not detach abort forwarder', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    // Lock the body; text() should reject without consuming.
-    const reader = response.body!.getReader();
-    await expect(response.text()).rejects.toThrow();
-    expect(wasRemoved(remove, listener)).toBe(false);
-
-    // Forwarder still live — mid-stream abort reaches the fetch controller.
-    external.abort();
-    expect(internal.signal.aborted).toBe(true);
-
-    await reader.cancel().catch(() => {});
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('releaseLock rejection of reader.closed does not detach abort forwarder', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    const reader = response.body!.getReader();
-    reader.releaseLock();
-    // Allow reader.closed rejection microtask to run.
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(wasRemoved(remove, listener)).toBe(false);
-    external.abort();
-    expect(internal.signal.aborted).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('response.bytes() detaches abort forwarder when available', async () => {
-    if (typeof (Response.prototype as { bytes?: unknown }).bytes !== 'function') {
-      return; // runtime without bytes()
-    }
-
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    await (response as Response & { bytes(): Promise<Uint8Array> }).bytes();
-    expect(wasRemoved(remove, listener)).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('cancelling an unread async-iterable bridge tears down upstream', async () => {
-    let returned = false;
-    const iterableBody = {
-      [Symbol.asyncIterator]() {
-        return {
-          async next() {
-            return { done: false as const, value: new TextEncoder().encode('x') };
-          },
-          async return() {
-            returned = true;
-            return { done: true as const, value: undefined };
-          },
-        };
-      },
-    };
-
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        ({
-          ok: true,
-          status: 200,
-          statusText: 'OK',
-          headers: new Headers({ 'Content-Type': 'application/octet-stream' }),
-          body: iterableBody,
-          url: 'http://localhost:5000/foo',
-          redirected: false,
-          type: 'basic',
-          clone() {
-            return this;
-          },
-          arrayBuffer: async () => new ArrayBuffer(0),
-          blob: async () => new Blob([]),
-          formData: async () => new FormData(),
-          json: async () => ({}),
-          text: async () => '',
-          bytes: async () => new Uint8Array(),
-        }) as unknown as Response,
-    });
-
-    const external = new AbortController();
-    const internal = new AbortController();
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    // Simulate retry CancelReadableStream before any pull.
-    await response.body!.cancel('retry');
-    expect(returned).toBe(true);
-  });
-
-  test('detaches when SDK-owned parsing rejects on malformed JSON', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      maxRetries: 0,
-      fetch: async () =>
-        new Response('{"ok": tru', {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-
-    await expect(client.get('/foo', { signal: external.signal })).rejects.toThrow();
-
-    const listener = abortListener(add);
-    expect(listener).toBeDefined();
-    expect(wasRemoved(remove, listener)).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('rejected body.cancel() on a locked stream keeps the abort forwarder', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    const reader = response.body!.getReader();
-    await expect(response.body!.cancel('nope')).rejects.toThrow();
-    expect(wasRemoved(remove, listener)).toBe(false);
-
-    // The reader still owns a live body, so a later abort must reach the fetch.
-    external.abort();
-    expect(internal.signal.aborted).toBe(true);
-
-    await reader.cancel().catch(() => {});
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('non-terminal reader.read() rejection keeps the abort forwarder', async () => {
-    const payload = new TextEncoder().encode('{"ok":true}');
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(payload, {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    const reader = response.body!.getReader({ mode: 'byob' });
-    // A zero-length view rejects the read but leaves the stream readable.
-    await expect(reader.read(new Uint8Array(0))).rejects.toThrow();
-    expect(wasRemoved(remove, listener)).toBe(false);
-
-    const { value } = await reader.read(new Uint8Array(payload.byteLength));
-    expect(new TextDecoder().decode(value)).toBe('{"ok":true}');
-
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('detaches when the request controller is aborted directly', async () => {
-    // Never-ending body: only the controller abort can end this request.
-    const body = new ReadableStream<Uint8Array>({ start() {} });
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(body, {
-          status: 200,
-          headers: { 'Content-Type': 'text/event-stream' },
-        }),
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
     await client.fetchWithTimeout('http://localhost:5000/foo', { signal: external.signal }, 30_000, internal);
 
-    const listener = abortListener(add);
-    expect(wasRemoved(remove, listener)).toBe(false);
-
-    // Documented escape hatch for raw streams: `stream.controller.abort()`.
+    // `stream.controller.abort()` is the documented escape hatch for raw streams.
     internal.abort();
-    expect(wasRemoved(remove, listener)).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
+    expect(observed!.aborted).toBe(true);
+    expect(external.signal.aborted).toBe(false);
   });
 
-  test('clears the stored cleanup hook once the body is done', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
+  test('leaves the response untouched', async () => {
+    const client = makeClient(async () => jsonResponse());
 
     const external = new AbortController();
     const internal = new AbortController();
@@ -683,201 +109,111 @@ describe('AbortSignal forwarder cleanup', () => {
       internal,
     );
 
-    expect(typeof (response as any)[CLEANUP_HOOK]).toBe('function');
-    await response.json();
-    // The hook captured the caller's signal — it must not outlive the body.
-    expect((response as any)[CLEANUP_HOOK]).toBeUndefined();
+    // Nothing about the body is wrapped or patched, so identity, byte-stream
+    // reads, and own-property shape all stay exactly as the runtime produced them.
+    expect(Object.keys(response)).toEqual([]);
+    expect(Object.getOwnPropertyNames(response.body!)).toEqual([]);
+    const reader = response.body!.getReader({ mode: 'byob' });
+    const { value } = await reader.read(new Uint8Array(32));
+    expect(new TextDecoder().decode(value)).toBe('{"ok":true}');
   });
 
-  test('keeps forwarding until both clone() branches are consumed', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
+  describe('combineAbortSignals', () => {
+    test('aborts when either input aborts, without listening on them', () => {
+      const controller = new AbortController();
+      const caller = new AbortController();
+
+      const combined = combineAbortSignals(controller.signal, caller.signal);
+      expect(combined).not.toBe(controller.signal);
+      expect(getEventListeners(caller.signal, 'abort')).toHaveLength(0);
+
+      caller.abort(new Error('caller went away'));
+      expect(combined.aborted).toBe(true);
+      expect((combined.reason as Error).message).toBe('caller went away');
+
+      const other = combineAbortSignals(new AbortController().signal, controller.signal);
+      controller.abort();
+      expect(other.aborted).toBe(true);
     });
 
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
+    test('passes the controller signal through when there is nothing to combine', () => {
+      const controller = new AbortController();
+      expect(combineAbortSignals(controller.signal, undefined)).toBe(controller.signal);
+      expect(combineAbortSignals(controller.signal, null)).toBe(controller.signal);
+    });
 
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
+    test('falls back when the caller signal is not composable', () => {
+      // Polyfilled signals (e.g. the `abort-controller` package) are rejected by
+      // native AbortSignal.any.
+      const polyfilled = {
+        aborted: false,
+        addEventListener() {},
+        removeEventListener() {},
+      } as unknown as AbortSignal;
 
-    const listener = abortListener(add);
-    const cloned = response.clone();
+      const controller = new AbortController();
+      expect(combineAbortSignals(controller.signal, polyfilled)).toBe(controller.signal);
+    });
 
-    await response.json();
-    expect(wasRemoved(remove, listener)).toBe(false);
-
-    await cloned.json();
-    expect(wasRemoved(remove, listener)).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
+    test('falls back to the controller signal without AbortSignal.any', () => {
+      const original = (AbortSignal as any).any;
+      try {
+        (AbortSignal as any).any = undefined;
+        const controller = new AbortController();
+        const caller = new AbortController();
+        expect(combineAbortSignals(controller.signal, caller.signal)).toBe(controller.signal);
+      } finally {
+        (AbortSignal as any).any = original;
+      }
+    });
   });
 
-  test('releases the reader lock after async iteration, like the native iterator', async () => {
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(JSON.stringify({ ok: true }), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-    });
+  test('forwards aborts with a listener when AbortSignal.any is unavailable', async () => {
+    const original = (AbortSignal as any).any;
+    try {
+      (AbortSignal as any).any = undefined;
 
-    const external = new AbortController();
-    const internal = new AbortController();
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
+      let observed: AbortSignal | undefined;
+      const client = makeClient(async (_url: any, init: any) => {
+        observed = init.signal;
+        return jsonResponse();
+      });
 
-    for await (const _chunk of response.body as AsyncIterable<Uint8Array>) {
-      // drain
+      const external = new AbortController();
+      const internal = new AbortController();
+      await client.fetchWithTimeout(
+        'http://localhost:5000/foo',
+        { signal: external.signal },
+        30_000,
+        internal,
+      );
+
+      expect(observed).toBe(internal.signal);
+      external.abort();
+      expect(internal.signal.aborted).toBe(true);
+    } finally {
+      (AbortSignal as any).any = original;
     }
-
-    expect(response.body!.locked).toBe(false);
-    // A permanently locked body would make this throw ERR_INVALID_STATE.
-    expect(() => response.body!.getReader()).not.toThrow();
   });
 
-  test('releases the reader lock when async iteration exits early', async () => {
-    const payload = new TextEncoder().encode('abcdefgh');
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        new Response(payload, {
-          status: 200,
-          headers: { 'Content-Type': 'application/octet-stream' },
-        }),
-    });
+  test('removes the fallback listener when the fetch itself fails', async () => {
+    const original = (AbortSignal as any).any;
+    try {
+      (AbortSignal as any).any = undefined;
 
-    const external = new AbortController();
-    const internal = new AbortController();
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
+      const client = makeClient(async () => {
+        throw new Error('connection failed');
+      });
 
-    for await (const _chunk of response.body as AsyncIterable<Uint8Array>) {
-      break;
+      const external = new AbortController();
+      const internal = new AbortController();
+      await expect(
+        client.fetchWithTimeout('http://localhost:5000/foo', { signal: external.signal }, 30_000, internal),
+      ).rejects.toThrow('connection failed');
+
+      expect(getEventListeners(external.signal, 'abort')).toHaveLength(0);
+    } finally {
+      (AbortSignal as any).any = original;
     }
-
-    expect(response.body!.locked).toBe(false);
-  });
-
-  test('detaches when a body helper rejects after draining through internal readers', async () => {
-    // Deno reads bodies with internal readers, so a mid-read failure surfaces
-    // only as a rejected helper: no patched stream method sees it, and standard
-    // streams expose no state to inspect afterwards.
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.error(new Error('body failed mid-read'));
-      },
-    });
-
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        ({
-          ok: false,
-          status: 500,
-          statusText: 'Internal Server Error',
-          headers: new Headers({ 'Content-Type': 'application/json' }),
-          body,
-          bodyUsed: false,
-          url: 'http://localhost:5000/foo',
-          redirected: false,
-          type: 'basic',
-          text: async () => {
-            throw new Error('body failed mid-read');
-          },
-        }) as unknown as Response,
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    const listener = abortListener(add);
-    // The helper owned a usable body, so its rejection is terminal.
-    await expect(response.text()).rejects.toThrow('body failed mid-read');
-    expect(wasRemoved(remove, listener)).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
-  });
-
-  test('does not build a synthetic body for null-body statuses', async () => {
-    const iterableBody = {
-      [Symbol.asyncIterator]() {
-        return {
-          async next() {
-            return { done: true as const, value: undefined };
-          },
-        };
-      },
-    };
-
-    const client = new OpenAI({
-      baseURL: 'http://localhost:5000/',
-      apiKey: 'My API Key',
-      adminAPIKey: 'My Admin API Key',
-      fetch: async () =>
-        ({
-          ok: false,
-          status: 304,
-          statusText: 'Not Modified',
-          headers: new Headers(),
-          body: iterableBody,
-          url: 'http://localhost:5000/foo',
-          redirected: false,
-          type: 'basic',
-        }) as unknown as Response,
-    });
-
-    const external = new AbortController();
-    const { add, remove } = spyAbortSignal(external.signal);
-    const internal = new AbortController();
-
-    const response = await client.fetchWithTimeout(
-      'http://localhost:5000/foo',
-      { signal: external.signal },
-      30_000,
-      internal,
-    );
-
-    // `new Response(body, { status: 304 })` would throw, so the original stands.
-    expect(response.status).toBe(304);
-    expect(response.body).toBe(iterableBody);
-    expect(wasRemoved(remove, abortListener(add))).toBe(true);
-
-    add.mockRestore();
-    remove.mockRestore();
   });
 });
