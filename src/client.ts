@@ -8,6 +8,7 @@ import { sleep } from './internal/utils/sleep';
 export type { Logger, LogLevel } from './internal/utils/log';
 import { castToError, isAbortError } from './internal/errors';
 import type { APIResponseProps } from './internal/parse';
+import { storeAbortCleanup } from './internal/abort-signal-cleanup';
 import { getPlatformHeaders } from './internal/detect-platform';
 import * as Shims from './internal/shims';
 import * as Opts from './internal/request-options';
@@ -376,12 +377,11 @@ export interface ClientOptions {
   provider?: Provider | undefined;
 }
 
-/** Attached to Response instances so parse/cleanup paths can drop AbortSignal listeners. */
-const ABORT_FORWARDER_CLEANUP = Symbol.for('openai.abortForwarderCleanup');
-
 function wrapAsyncIteratorWithCleanup<T>(
   iterator: AsyncIterator<T>,
   cleanup: () => void,
+  /** When true, early-exit return() must not drop abort forwarding (preventCancel streams). */
+  cleanupOnReturn = true,
 ): AsyncIterableIterator<T> {
   return {
     async next(...args: [] | [any]) {
@@ -399,7 +399,7 @@ function wrapAsyncIteratorWithCleanup<T>(
         if (iterator.return) return await iterator.return(value);
         return { done: true as const, value: undefined };
       } finally {
-        cleanup();
+        if (cleanupOnReturn) cleanup();
       }
     },
     async throw(e?: any) {
@@ -1098,7 +1098,7 @@ export class OpenAI {
    * - public Response.json/text/... (Deno drains the body via private readers)
    * - body.getReader / cancel / asyncIterator (Node streaming / SDK SSE)
    * - body.pipeTo / values (native stream helpers that skip getReader)
-   * - parse-time detach via `_releaseAbortForwarder` for non-stream responses
+   * - parse-time detach via `releaseAbortCleanup` for non-stream responses
    */
   private _detachAbortOnBodyEnd(
     response: Response,
@@ -1114,8 +1114,9 @@ export class OpenAI {
       signal.removeEventListener('abort', abort);
     };
 
-    // Expose for defaultParseResponse (Deno json/text may not hit body hooks).
-    (response as any)[ABORT_FORWARDER_CLEANUP] = cleanup;
+    // Symbol + WeakMap (non-extensible Responses) for parse-time cleanup — not a
+    // public OpenAI method (see AGENTS.md / declaration emit).
+    storeAbortCleanup(response, cleanup);
 
     if (signal.aborted) {
       cleanup();
@@ -1130,7 +1131,7 @@ export class OpenAI {
     }
 
     // Response body helpers — Deno/undici often drain through internals; these
-    // Instance methods still wrap the full consume path for the common API.
+    // instance methods still wrap the full consume path for the common API.
     for (const method of ['arrayBuffer', 'blob', 'formData', 'json', 'text'] as const) {
       try {
         const original = (response as any)[method]?.bind(response);
@@ -1151,6 +1152,11 @@ export class OpenAI {
     }
 
     const body = response.body;
+    // node-fetch / custom fetch: body may be an async iterable without getReader.
+    if (body != null && typeof (body as any).getReader !== 'function') {
+      return this._wrapAsyncIterableBodyForAbortCleanup(response, cleanup);
+    }
+
     try {
       const originalGetReader = body.getReader.bind(body);
       Object.defineProperty(body, 'getReader', {
@@ -1174,6 +1180,12 @@ export class OpenAI {
             cleanup();
             return originalCancel(reason);
           };
+
+          // Some consumers stop after the last chunk without a trailing {done:true}
+          // read — observe reader.closed so cleanup still runs (#1811).
+          if (reader.closed && typeof reader.closed.then === 'function') {
+            reader.closed.then(() => cleanup(), () => cleanup());
+          }
 
           return reader;
         },
@@ -1208,8 +1220,10 @@ export class OpenAI {
         Object.defineProperty(body, 'values', {
           configurable: true,
           value: (...args: any[]) => {
+            const preventCancel = args[0]?.preventCancel === true;
             const iterator = originalValues(...args);
-            return wrapAsyncIteratorWithCleanup(iterator, cleanup);
+            // preventCancel early exit must keep abort forwarder (body still open).
+            return wrapAsyncIteratorWithCleanup(iterator, cleanup, !preventCancel);
           },
         });
       }
@@ -1220,50 +1234,29 @@ export class OpenAI {
         configurable: true,
         value: () => {
           const reader = body.getReader();
-          return {
-            async next() {
-              try {
-                const result = await reader.read();
-                if (result.done) {
-                  try {
-                    reader.releaseLock();
-                  } catch {
-                    // ignore double-release
-                  }
+          return wrapAsyncIteratorWithCleanup(
+            {
+              next: () => reader.read(),
+              async return() {
+                try {
+                  await reader.cancel();
+                } catch {
+                  // ignore
                 }
-                return result;
-              } catch (err) {
                 try {
                   reader.releaseLock();
                 } catch {
                   // ignore
                 }
-                throw err;
-              }
+                return { done: true as const, value: undefined };
+              },
             },
-            async return() {
-              try {
-                await reader.cancel();
-              } catch {
-                // ignore
-              }
-              try {
-                reader.releaseLock();
-              } catch {
-                // ignore
-              }
-              return { done: true as const, value: undefined };
-            },
-            [Symbol.asyncIterator]() {
-              return this;
-            },
-          };
+            cleanup,
+          );
         },
       });
     } catch {
-      // If the runtime freezes stream methods, fall back to wrapping without
-      // losing identity of a successful request: detach only when body ends via
-      // a best-effort pull stream still drives abort during consumption.
+      // If the runtime freezes stream methods, fall back without losing status/url.
       return this._wrapResponseBodyForAbortCleanup(response, cleanup);
     }
 
@@ -1271,17 +1264,43 @@ export class OpenAI {
   }
 
   /**
-   * Best-effort detach when parsing finishes (covers Deno Body internals that
-   * never call the public body.getReader property). Safe to call multiple times.
-   * Do not call for streaming/binary-raw responses still held by the caller.
+   * Fallback for custom-fetch bodies that are async-iterable but lack getReader
+   * (classic node-fetch). Avoids throwing on getReader while still cleaning up.
    */
-  _releaseAbortForwarder(response: Response): void {
-    try {
-      const cleanup = (response as any)?.[ABORT_FORWARDER_CLEANUP];
-      if (typeof cleanup === 'function') cleanup();
-    } catch {
-      // ignore
+  private _wrapAsyncIterableBodyForAbortCleanup(response: Response, cleanup: () => void): Response {
+    const body = response.body as any;
+    if (body == null || typeof body[Symbol.asyncIterator] !== 'function') {
+      // Nothing we can observe — detach so timeouts cannot pin Deno/Node open.
+      cleanup();
+      return response;
     }
+
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          for await (const chunk of body) {
+            const bytes =
+              chunk instanceof Uint8Array
+                ? chunk
+                : typeof chunk === 'string'
+                  ? new TextEncoder().encode(chunk)
+                  : new Uint8Array(chunk);
+            controller.enqueue(bytes);
+          }
+          cleanup();
+          controller.close();
+        } catch (err) {
+          cleanup();
+          controller.error(err);
+        }
+      },
+      cancel(reason) {
+        cleanup();
+        return body.cancel?.(reason);
+      },
+    });
+
+    return this._mirrorResponseIdentity(response, stream, cleanup);
   }
 
   /**
@@ -1293,6 +1312,11 @@ export class OpenAI {
     if (body == null) {
       cleanup();
       return response;
+    }
+
+    // Prefer async-iterable path when getReader is missing (node-fetch).
+    if (typeof (body as any).getReader !== 'function') {
+      return this._wrapAsyncIterableBodyForAbortCleanup(response, cleanup);
     }
 
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -1321,6 +1345,14 @@ export class OpenAI {
       },
     });
 
+    return this._mirrorResponseIdentity(response, stream, cleanup);
+  }
+
+  private _mirrorResponseIdentity(
+    response: Response,
+    stream: ReadableStream<Uint8Array>,
+    cleanup: () => void,
+  ): Response {
     const wrapped = new Response(stream, {
       status: response.status,
       statusText: response.statusText,
@@ -1338,6 +1370,7 @@ export class OpenAI {
       // Ignore if the host Response forbids redefining identity fields.
     }
 
+    storeAbortCleanup(wrapped, cleanup);
     return wrapped;
   }
 

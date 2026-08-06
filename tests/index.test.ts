@@ -407,10 +407,11 @@ describe('instantiate client', () => {
     );
 
     const listener = addSpy.mock.calls.find((call) => call[0] === 'abort')?.[1];
-    // After our wrapper json() which finally-cleans, or via _releaseAbortForwarder
+    // After our wrapper json() which finally-cleans
     await response.json();
-    // parse path would also call _releaseAbortForwarder
-    (client as any)._releaseAbortForwarder(response);
+    // parse path would also call releaseAbortCleanup (Symbol/WeakMap internal)
+    const { releaseAbortCleanup } = require('../src/internal/abort-signal-cleanup');
+    releaseAbortCleanup(response);
 
     expect(listener).toBeDefined();
     expect(

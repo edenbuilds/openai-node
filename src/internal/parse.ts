@@ -3,6 +3,7 @@
 import type { FinalRequestOptions } from './request-options';
 import { Stream } from '../core/streaming';
 import { type OpenAI } from '../client';
+import { releaseAbortCleanup } from './abort-signal-cleanup';
 import { formatRequestDetails, loggerFor } from './utils/log';
 import type { AbstractPage } from '../pagination';
 
@@ -76,8 +77,9 @@ export async function defaultParseResponse<T>(
   // Non-streaming, fully parsed responses: ensure AbortSignal.timeout listeners
   // drop even when the runtime consumed the body via private readers (Deno).
   // Streaming / binary-raw leave cleanup to body consumption hooks.
+  // Cleanup is internal (Symbol/WeakMap) — not a public OpenAI method.
   if (!props.options.stream && !props.options.__binaryResponse) {
-    (client as any)._releaseAbortForwarder?.(response);
+    releaseAbortCleanup(response);
   }
 
   loggerFor(client).debug(
