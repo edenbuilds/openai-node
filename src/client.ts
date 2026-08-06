@@ -416,6 +416,12 @@ function wrapAsyncIteratorWithCleanup<T>(
   };
 }
 
+/** Best-effort: some runtimes expose ReadableStream.state for closed/errored. */
+function isReadableStreamTerminal(body: ReadableStream<Uint8Array>): boolean {
+  const state = (body as { state?: string }).state;
+  return state === 'closed' || state === 'errored';
+}
+
 /**
  * API Client for interfacing with the OpenAI API.
  */
@@ -1206,10 +1212,19 @@ export class OpenAI {
         Object.defineProperty(body, 'pipeTo', {
           configurable: true,
           value: async (...args: any[]) => {
+            const preventCancel = args[1]?.preventCancel === true;
             try {
-              return await originalPipeTo(...args);
-            } finally {
+              const result = await originalPipeTo(...args);
+              // Successful pipeTo fully drained the source.
               cleanup();
+              return result;
+            } catch (err) {
+              // With preventCancel, a dest abort/reject leaves the source open for
+              // further reads — keep abort forwarding until the source actually closes.
+              if (!preventCancel || isReadableStreamTerminal(body)) {
+                cleanup();
+              }
+              throw err;
             }
           },
         });
@@ -1266,6 +1281,8 @@ export class OpenAI {
   /**
    * Fallback for custom-fetch bodies that are async-iterable but lack getReader
    * (classic node-fetch). Avoids throwing on getReader while still cleaning up.
+   * Bridged via `pull()` so upstream consumption follows downstream demand
+   * (controller.desiredSize) instead of buffering the entire payload in `start()`.
    */
   private _wrapAsyncIterableBodyForAbortCleanup(response: Response, cleanup: () => void): Response {
     const body = response.body as any;
@@ -1275,30 +1292,43 @@ export class OpenAI {
       return response;
     }
 
-    const stream = new ReadableStream<Uint8Array>({
-      async start(controller) {
-        try {
-          for await (const chunk of body) {
+    let iterator: AsyncIterator<unknown> | undefined;
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          try {
+            iterator ??= body[Symbol.asyncIterator]() as AsyncIterator<unknown>;
+            // One chunk per pull — the stream runtime re-invokes while desiredSize > 0.
+            const { done, value } = await iterator.next();
+            if (done) {
+              cleanup();
+              controller.close();
+              return;
+            }
             const bytes =
-              chunk instanceof Uint8Array
-                ? chunk
-                : typeof chunk === 'string'
-                  ? new TextEncoder().encode(chunk)
-                  : new Uint8Array(chunk);
+              value instanceof Uint8Array
+                ? value
+                : typeof value === 'string'
+                  ? new TextEncoder().encode(value)
+                  : new Uint8Array(value as ArrayBufferLike);
             controller.enqueue(bytes);
+          } catch (err) {
+            cleanup();
+            controller.error(err);
           }
+        },
+        cancel(reason) {
           cleanup();
-          controller.close();
-        } catch (err) {
-          cleanup();
-          controller.error(err);
-        }
+          if (iterator?.return) {
+            return Promise.resolve(iterator.return(reason)).then(() => undefined);
+          }
+          return body.cancel?.(reason);
+        },
       },
-      cancel(reason) {
-        cleanup();
-        return body.cancel?.(reason);
-      },
-    });
+      // highWaterMark 0: do not prefetch — pull only when a consumer reads
+      // (follows controller.desiredSize / downstream demand).
+      { highWaterMark: 0 },
+    );
 
     return this._mirrorResponseIdentity(response, stream, cleanup);
   }
