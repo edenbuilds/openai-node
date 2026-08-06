@@ -72,15 +72,16 @@ export async function defaultParseResponse<T>(
 
     const text = await response.text();
     return text as unknown as T;
-  })();
-
-  // Non-streaming, fully parsed responses: ensure AbortSignal.timeout listeners
-  // drop even when the runtime consumed the body via private readers (Deno).
-  // Streaming / binary-raw leave cleanup to body consumption hooks.
-  // Cleanup is internal (Symbol/WeakMap) — not a public OpenAI method.
-  if (!props.options.stream && !props.options.__binaryResponse) {
-    releaseAbortCleanup(response);
-  }
+  })().finally(() => {
+    // The SDK owns the body here, so release the caller's abort forwarder once
+    // parsing settles — runtimes such as Deno drain the body through internal
+    // readers that the response hooks cannot observe, and a rejected `json()`
+    // has still consumed it. Streaming and raw-binary responses stay with the
+    // caller and keep their body hooks instead.
+    if (!props.options.stream && !props.options.__binaryResponse) {
+      releaseAbortCleanup(response);
+    }
+  });
 
   loggerFor(client).debug(
     `[${requestLogID}] response parsed`,
