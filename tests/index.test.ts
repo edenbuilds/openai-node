@@ -368,6 +368,60 @@ describe('instantiate client', () => {
     removeSpy.mockRestore();
   });
 
+  test('detaches abort listener after response.json() when body hooks are bypassed', async () => {
+    // Regression for Deno/Body: response.json() may drain via private readers and
+    // never call the public body.getReader property. parse still detaches.
+    const rawJson = Response.prototype.json;
+    const client = new OpenAI({
+      baseURL: 'http://localhost:5000/',
+      apiKey: 'My API Key',
+      adminAPIKey: 'My Admin API Key',
+      fetch: async () => {
+        const response = new Response(JSON.stringify({ ok: true }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+        // Simulate a runtime where Body.json does not go through getReader.
+        Object.defineProperty(response, 'json', {
+          configurable: true,
+          value: async function (this: Response) {
+            // Read without using our patched getReader path by restoring prototype
+            // temporarily on a clone's internal… simplest: use arrayBuffer then parse.
+            const buf = await Response.prototype.arrayBuffer.call(this);
+            return JSON.parse(new TextDecoder().decode(buf));
+          },
+        });
+        return response;
+      },
+    });
+
+    const external = new AbortController();
+    const addSpy = jest.spyOn(external.signal, 'addEventListener');
+    const removeSpy = jest.spyOn(external.signal, 'removeEventListener');
+    const internal = new AbortController();
+
+    const response = await client.fetchWithTimeout(
+      'http://localhost:5000/foo',
+      { signal: external.signal },
+      30_000,
+      internal,
+    );
+
+    const listener = addSpy.mock.calls.find((call) => call[0] === 'abort')?.[1];
+    // After our wrapper json() which finally-cleans, or via _releaseAbortForwarder
+    await response.json();
+    // parse path would also call _releaseAbortForwarder
+    (client as any)._releaseAbortForwarder(response);
+
+    expect(listener).toBeDefined();
+    expect(
+      removeSpy.mock.calls.some((call) => call[0] === 'abort' && call[1] === listener),
+    ).toBe(true);
+
+    addSpy.mockRestore();
+    removeSpy.mockRestore();
+    void rawJson;
+  });
+
   test('detaches abort listener after native for-await consumption', async () => {
     // Regression: ReadableStreamToAsyncIterable prefers body[Symbol.asyncIterator]
     // and never calls getReader when present. Stream finish must still cleanup.

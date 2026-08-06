@@ -376,6 +376,46 @@ export interface ClientOptions {
   provider?: Provider | undefined;
 }
 
+/** Attached to Response instances so parse/cleanup paths can drop AbortSignal listeners. */
+const ABORT_FORWARDER_CLEANUP = Symbol.for('openai.abortForwarderCleanup');
+
+function wrapAsyncIteratorWithCleanup<T>(
+  iterator: AsyncIterator<T>,
+  cleanup: () => void,
+): AsyncIterableIterator<T> {
+  return {
+    async next(...args: [] | [any]) {
+      try {
+        const result = await (iterator.next as any)(...args);
+        if (result.done) cleanup();
+        return result;
+      } catch (err) {
+        cleanup();
+        throw err;
+      }
+    },
+    async return(value?: any) {
+      try {
+        if (iterator.return) return await iterator.return(value);
+        return { done: true as const, value: undefined };
+      } finally {
+        cleanup();
+      }
+    },
+    async throw(e?: any) {
+      try {
+        if (iterator.throw) return await iterator.throw(e);
+        throw e;
+      } finally {
+        cleanup();
+      }
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+}
+
 /**
  * API Client for interfacing with the OpenAI API.
  */
@@ -1053,6 +1093,12 @@ export class OpenAI {
    * Immediate detach when there is nothing to read (null body, 204, Content-Length: 0)
    * — `defaultParseResponse` skips body reads in those cases, and leaving a
    * AbortSignal.timeout() listener would keep Deno alive until the timeout (#1811).
+   *
+   * Coverage:
+   * - public Response.json/text/... (Deno drains the body via private readers)
+   * - body.getReader / cancel / asyncIterator (Node streaming / SDK SSE)
+   * - body.pipeTo / values (native stream helpers that skip getReader)
+   * - parse-time detach via `_releaseAbortForwarder` for non-stream responses
    */
   private _detachAbortOnBodyEnd(
     response: Response,
@@ -1068,6 +1114,9 @@ export class OpenAI {
       signal.removeEventListener('abort', abort);
     };
 
+    // Expose for defaultParseResponse (Deno json/text may not hit body hooks).
+    (response as any)[ABORT_FORWARDER_CLEANUP] = cleanup;
+
     if (signal.aborted) {
       cleanup();
       return response;
@@ -1080,13 +1129,27 @@ export class OpenAI {
       return response;
     }
 
-    // Hook the original body's reader/cancel and async-iterator paths so we do
-    // not replace Response (which would drop `url`/`redirected` and break
-    // byte-stream/BYOB readers). Critical: `_iterSSEMessages` uses
-    // `ReadableStreamToAsyncIterable`, which prefers native `for await` when
-    // `body[Symbol.asyncIterator]` exists — that path never hits getReader, so
-    // we must wrap the async iterator too or AbortSignal.timeout listeners leak
-    // after successful streams (Deno hang, #1811).
+    // Response body helpers — Deno/undici often drain through internals; these
+    // Instance methods still wrap the full consume path for the common API.
+    for (const method of ['arrayBuffer', 'blob', 'formData', 'json', 'text'] as const) {
+      try {
+        const original = (response as any)[method]?.bind(response);
+        if (typeof original !== 'function') continue;
+        Object.defineProperty(response, method, {
+          configurable: true,
+          value: async (...args: any[]) => {
+            try {
+              return await original(...args);
+            } finally {
+              cleanup();
+            }
+          },
+        });
+      } catch {
+        // ignore frozen Response prototypes
+      }
+    }
+
     const body = response.body;
     try {
       const originalGetReader = body.getReader.bind(body);
@@ -1124,6 +1187,32 @@ export class OpenAI {
           return originalCancel(reason);
         },
       });
+
+      // Native helpers that bypass the public getReader surface (WHATWG streams).
+      const originalPipeTo = (body as any).pipeTo?.bind(body);
+      if (typeof originalPipeTo === 'function') {
+        Object.defineProperty(body, 'pipeTo', {
+          configurable: true,
+          value: async (...args: any[]) => {
+            try {
+              return await originalPipeTo(...args);
+            } finally {
+              cleanup();
+            }
+          },
+        });
+      }
+
+      const originalValues = (body as any).values?.bind(body);
+      if (typeof originalValues === 'function') {
+        Object.defineProperty(body, 'values', {
+          configurable: true,
+          value: (...args: any[]) => {
+            const iterator = originalValues(...args);
+            return wrapAsyncIteratorWithCleanup(iterator, cleanup);
+          },
+        });
+      }
 
       // Prefer our getReader-based async iterator so native for-await (Node/Deno)
       // still runs cleanup when the stream ends or is early-returned/broken.
@@ -1179,6 +1268,20 @@ export class OpenAI {
     }
 
     return response;
+  }
+
+  /**
+   * Best-effort detach when parsing finishes (covers Deno Body internals that
+   * never call the public body.getReader property). Safe to call multiple times.
+   * Do not call for streaming/binary-raw responses still held by the caller.
+   */
+  _releaseAbortForwarder(response: Response): void {
+    try {
+      const cleanup = (response as any)?.[ABORT_FORWARDER_CLEANUP];
+      if (typeof cleanup === 'function') cleanup();
+    } catch {
+      // ignore
+    }
   }
 
   /**

@@ -50,6 +50,8 @@ export async function defaultParseResponse<T>(
     }
 
     if (props.options.__binaryResponse) {
+      // Caller still owns the Response body — keep the abort forwarder alive until
+      // they consume/cancel it (see client body hooks).
       return response as unknown as T;
     }
 
@@ -70,6 +72,14 @@ export async function defaultParseResponse<T>(
     const text = await response.text();
     return text as unknown as T;
   })();
+
+  // Non-streaming, fully parsed responses: ensure AbortSignal.timeout listeners
+  // drop even when the runtime consumed the body via private readers (Deno).
+  // Streaming / binary-raw leave cleanup to body consumption hooks.
+  if (!props.options.stream && !props.options.__binaryResponse) {
+    (client as any)._releaseAbortForwarder?.(response);
+  }
+
   loggerFor(client).debug(
     `[${requestLogID}] response parsed`,
     formatRequestDetails({
