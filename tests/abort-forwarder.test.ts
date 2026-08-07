@@ -1,6 +1,6 @@
 import { getEventListeners } from 'node:events';
 
-import OpenAI from 'openai';
+import OpenAI, { APIUserAbortError } from 'openai';
 import { Stream } from 'openai/core/streaming';
 
 /**
@@ -51,7 +51,7 @@ describe('caller AbortSignal handling', () => {
     const controller = new AbortController();
     controller.abort();
 
-    await expect(client.get('/foo', { signal: controller.signal })).rejects.toThrow(OpenAI.APIUserAbortError);
+    await expect(client.get('/foo', { signal: controller.signal })).rejects.toThrow(APIUserAbortError);
   });
 
   test('caller abort reaches the fetch after headers arrive', async () => {
